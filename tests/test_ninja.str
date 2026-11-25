@@ -1,0 +1,46 @@
+import ninja
+import lmon
+import json
+import os
+
+def _exclaim(s: str) -> str:
+    return s + "!"
+
+def main() -> None:
+    env = ninja.Environment("/tmp")
+    env.add_filter("exclaim", _exclaim)
+
+    # 1. Auto-escaping, dot-paths, filters, comments
+    ctx = json.loads('{"user":{"name":"<Lucian>"},"items":["a","b","c"],"count":3}')
+    out1 = env.render_string("Hi {{ user.name }}{# comment #} ({{ items | length }})", ctx)
+    assert out1 == "Hi &lt;Lucian&gt; (3)"
+
+    out2 = env.render_string("{{ user.name | safe | upper | exclaim }}", ctx)
+    assert out2 == "<LUCIAN>!"
+
+    out3 = env.render_string("{{ missing | default('fallback') }}", ctx)
+    assert out3 == "fallback"
+
+    # 2. If / elif / else
+    tpl_if = "{% if count > 5 %}big{% elif count == 3 %}three{% else %}other{% endif %}"
+    assert env.render_string(tpl_if, ctx) == "three"
+
+    # 3. For loop with loop.index and loop.last
+    tpl_for = "{% for x in items %}{{ loop.index }}:{{ x }}{% if not loop.last %},{% endif %}{% endfor %}"
+    assert env.render_string(tpl_for, ctx) == "1:a,2:b,3:c"
+
+    # 4. Template inheritance (extends + block)
+    fb = open("/tmp/ninja_test_base.html", "w")
+    fb.write("<h1>{% block title %}Default{% endblock %}</h1><main>{% block body %}{% endblock %}</main>")
+    fb.close()
+    fc = open("/tmp/ninja_test_child.html", "w")
+    fc.write('{% extends "ninja_test_base.html" %}{% block title %}Home{% endblock %}{% block body %}Count={{ count }}{% endblock %}')
+    fc.close()
+    out4 = env.render("ninja_test_child.html", ctx)
+    assert out4 == "<h1>Home</h1><main>Count=3</main>"
+
+    os.remove("/tmp/ninja_test_base.html")
+    os.remove("/tmp/ninja_test_child.html")
+    print("test_ninja: PASS")
+
+main()

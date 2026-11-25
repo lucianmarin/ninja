@@ -1,0 +1,531 @@
+# Ninja — Jinja2-inspired template engine for Stricta
+import html
+import json
+import os
+from json import DOM, DOM_NULL, DOM_BOOL, DOM_INT, DOM_FLOAT, DOM_STR, DOM_ARRAY, DOM_OBJECT
+from typing import Callable
+
+def html_escape(s: str) -> str:
+    return html.escape(s)
+
+def _val_to_str(v: DOM) -> str:
+    if v.kind == DOM_NULL:
+        return ""
+    if v.kind == DOM_STR:
+        return v.as_str()
+    if v.kind == DOM_INT:
+        return str(v.as_int())
+    if v.kind == DOM_FLOAT:
+        return str(v.as_float())
+    if v.kind == DOM_BOOL:
+        return "true" if v.as_bool() else "false"
+    return json.dumps(v)
+
+def _val_truthy(v: DOM) -> bool:
+    if v.kind == DOM_NULL:
+        return False
+    if v.kind == DOM_BOOL:
+        return v.as_bool()
+    if v.kind == DOM_INT:
+        return v.as_int() != 0
+    if v.kind == DOM_FLOAT:
+        return v.as_float() != 0.0
+    if v.kind == DOM_STR:
+        return len(v.as_str()) > 0
+    if v.kind == DOM_ARRAY:
+        return len(v.arr) > 0
+    if v.kind == DOM_OBJECT:
+        return len(v.keys) > 0
+    return False
+
+def _resolve_path(ctx: DOM, expr: str) -> DOM:
+    e = expr.strip()
+    if len(e) == 0:
+        return json.json_null()
+    if (e.startswith('"') and e.endswith('"')) or (e.startswith("'") and e.endswith("'")):
+        return json.json_str(e[1:len(e) - 1])
+    if e == "true" or e == "True":
+        return json.json_bool(True)
+    if e == "false" or e == "False":
+        return json.json_bool(False)
+    if e == "none" or e == "None" or e == "null":
+        return json.json_null()
+    is_num = True
+    i = 0
+    p = e.bin
+    if int(p[0]) == 45 and len(e) > 1:
+        i = 1
+    while i < len(e):
+        b = int(p[i])
+        if b < 48 or b > 57:
+            is_num = False
+            break
+        i += 1
+    if is_num:
+        return json.json_int(int(e))
+
+    parts = e.split(".")
+    if ctx.kind != DOM_OBJECT:
+        return json.json_null()
+    p0 = parts[0]
+    b0 = p0.find("[")
+    cur_opt: DOM | None = None
+    if b0 >= 0 and p0.endswith("]"):
+        h0 = p0[0:b0]
+        idx0 = _resolve_path(ctx, p0[b0 + 1:len(p0) - 1].strip())
+        base0 = ctx.get(h0)
+        if base0 is None:
+            return json.json_null()
+        if base0.kind == DOM_ARRAY and idx0.kind == DOM_INT:
+            ii0 = idx0.as_int()
+            if ii0 < 0 or ii0 >= len(base0.arr):
+                return json.json_null()
+            cur_opt = base0.arr[ii0]
+        elif base0.kind == DOM_OBJECT:
+            cur_opt = base0.get(_val_to_str(idx0))
+        else:
+            return json.json_null()
+    else:
+        cur_opt = ctx.get(p0)
+    if cur_opt is None:
+        return json.json_null()
+    cur = cur_opt
+    pi = 1
+    while pi < len(parts):
+        part = parts[pi]
+        bpos = part.find("[")
+        if bpos >= 0 and part.endswith("]"):
+            head = part[0:bpos]
+            idx_expr = part[bpos + 1:len(part) - 1].strip()
+            if len(head) > 0:
+                if cur.kind != DOM_OBJECT:
+                    return json.json_null()
+                nxt = cur.get(head)
+                if nxt is None:
+                    return json.json_null()
+                cur = nxt
+            idx_val = _resolve_path(ctx, idx_expr)
+            if cur.kind == DOM_ARRAY:
+                if idx_val.kind != DOM_INT:
+                    return json.json_null()
+                ii = idx_val.as_int()
+                if ii < 0 or ii >= len(cur.arr):
+                    return json.json_null()
+                cur = cur.arr[ii]
+            elif cur.kind == DOM_OBJECT:
+                k = _val_to_str(idx_val)
+                nxt2 = cur.get(k)
+                if nxt2 is None:
+                    return json.json_null()
+                cur = nxt2
+            else:
+                return json.json_null()
+        else:
+            if cur.kind != DOM_OBJECT:
+                return json.json_null()
+            nxt3 = cur.get(part)
+            if nxt3 is None:
+                return json.json_null()
+            cur = nxt3
+        pi += 1
+    return cur.copy()
+
+def _in_container(ctx: DOM, lhs_expr: str, rhs_expr: str) -> bool:
+    lv = _resolve_path(ctx, lhs_expr)
+    ls = _val_to_str(lv)
+    re = rhs_expr.strip()
+    if re.startswith("[") and re.endswith("]"):
+        inner = re[1:len(re) - 1].strip()
+        if len(inner) == 0:
+            return False
+        items = inner.split(",")
+        for it in items:
+            iv = _resolve_path(ctx, it)
+            if _val_to_str(iv) == ls:
+                return True
+        return False
+    rv = _resolve_path(ctx, re)
+    if rv.kind == DOM_ARRAY:
+        for el in rv.arr:
+            if _val_to_str(el) == ls:
+                return True
+        return False
+    if rv.kind == DOM_OBJECT:
+        return rv.get(ls) is not None
+    if rv.kind == DOM_STR:
+        return ls in rv.as_str()
+    return False
+
+def _eval_cond(ctx: DOM, expr: str) -> bool:
+    e = expr.strip()
+    if e.startswith("not "):
+        return not _eval_cond(ctx, e[4:len(e)])
+    or_pos = e.find(" or ")
+    if or_pos > 0:
+        return _eval_cond(ctx, e[0:or_pos]) or _eval_cond(ctx, e[or_pos + 4:len(e)])
+    and_pos = e.find(" and ")
+    if and_pos > 0:
+        return _eval_cond(ctx, e[0:and_pos]) and _eval_cond(ctx, e[and_pos + 5:len(e)])
+
+    nin_pos = e.find(" not in ")
+    if nin_pos > 0:
+        return not _in_container(ctx, e[0:nin_pos], e[nin_pos + 8:len(e)])
+    in_pos = e.find(" in ")
+    if in_pos > 0:
+        return _in_container(ctx, e[0:in_pos], e[in_pos + 4:len(e)])
+
+    ops: list[str] = ["==", "!=", ">=", "<=", ">", "<"]
+    for op in ops:
+        pos = e.find(op)
+        if pos > 0:
+            lv = _resolve_path(ctx, e[0:pos])
+            rv = _resolve_path(ctx, e[pos + len(op):len(e)])
+            if op == "==":
+                return _val_to_str(lv) == _val_to_str(rv)
+            if op == "!=":
+                return _val_to_str(lv) != _val_to_str(rv)
+            li = lv.as_int() if lv.kind == DOM_INT else 0
+            ri = rv.as_int() if rv.kind == DOM_INT else 0
+            if op == ">=":
+                return li >= ri
+            if op == "<=":
+                return li <= ri
+            if op == ">":
+                return li > ri
+            if op == "<":
+                return li < ri
+
+    return _val_truthy(_resolve_path(ctx, e))
+
+TOK_TEXT: int = 0
+TOK_VAR: int = 1
+TOK_TAG: int = 2
+
+class _Tok:
+    kind: int
+    val: str
+
+    def __init__(self, kind: int, val: str) -> None:
+        self.kind = kind
+        self.val = val
+
+def _find_from(s: str, sub: str, start: int) -> int:
+    if start >= len(s):
+        return -1
+    rel = s[start:len(s)].find(sub)
+    if rel < 0:
+        return -1
+    return start + rel
+
+def _tokenize(src: str) -> list[_Tok]:
+    toks: list[_Tok] = []
+    n = len(src)
+    i = 0
+    while i < n:
+        pos = _find_from(src, "{", i)
+        if pos < 0 or pos + 1 >= n:
+            if i < n:
+                toks.append(_Tok(TOK_TEXT, src[i:n]))
+            break
+        nxt = src[pos + 1:pos + 2]
+        if nxt == "{" or nxt == "%" or nxt == "#":
+            if pos > i:
+                toks.append(_Tok(TOK_TEXT, src[i:pos]))
+            close = "}}" if nxt == "{" else ("%}" if nxt == "%" else "#}")
+            end = _find_from(src, close, pos + 2)
+            if end < 0:
+                toks.append(_Tok(TOK_TEXT, src[pos:n]))
+                break
+            inner = src[pos + 2:end].strip()
+            if nxt == "{":
+                toks.append(_Tok(TOK_VAR, inner))
+            elif nxt == "%":
+                toks.append(_Tok(TOK_TAG, inner))
+            i = end + 2
+        else:
+            toks.append(_Tok(TOK_TEXT, src[i:pos + 1]))
+            i = pos + 1
+    return toks
+
+def _find_matching_end(toks: list[_Tok], start: int, open_kw: str, close_kw: str) -> int:
+    depth = 1
+    i = start
+    n = len(toks)
+    while i < n:
+        if toks[i].kind == TOK_TAG:
+            t = toks[i].val
+            if t.startswith(open_kw + " ") or t == open_kw:
+                depth += 1
+            elif t == close_kw:
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    return n
+
+def _extract_blocks(src: str) -> dict[str, str]:
+    blocks: dict[str, str] = {}
+    toks = _tokenize(src)
+    i = 0
+    n = len(toks)
+    while i < n:
+        if toks[i].kind == TOK_TAG and toks[i].val.startswith("block "):
+            bname = toks[i].val[6:len(toks[i].val)].strip()
+            end_i = _find_matching_end(toks, i + 1, "block", "endblock")
+            inner_parts: list[str] = []
+            j = i + 1
+            while j < end_i:
+                if toks[j].kind == TOK_TEXT:
+                    inner_parts.append(toks[j].val.copy())
+                elif toks[j].kind == TOK_VAR:
+                    inner_parts.append("{{ " + toks[j].val + " }}")
+                elif toks[j].kind == TOK_TAG:
+                    inner_parts.append("{% " + toks[j].val + " %}")
+                j += 1
+            blocks[bname] = "".join(inner_parts)
+            i = end_i + 1
+        else:
+            i += 1
+    return blocks
+
+class Environment:
+    template_dir: str
+    cache: dict[str, str]
+    tok_cache: dict[str, list[_Tok]]
+    filters: dict[str, Callable[[str], str]]
+
+    def __init__(self, template_dir: str = ".") -> None:
+        self.template_dir = template_dir
+        self.cache = {}
+        self.tok_cache = {}
+        self.filters = {}
+
+    def add_filter(self, name: str, fn: Callable[[str], str]) -> None:
+        self.filters[name] = fn
+
+    def load_source(self, name: str) -> str:
+        if name in self.cache:
+            return self.cache[name].copy()
+        full = self.template_dir + "/" + name
+        f = open(full, "r")
+        src = f.read()
+        f.close()
+        self.cache[name.copy()] = src.copy()
+        return src
+
+    def load_tokens(self, name: str) -> list[_Tok]:
+        if name in self.tok_cache:
+            return self.tok_cache[name].copy()
+        src = self.load_source(name)
+        toks = _tokenize(src)
+        self.tok_cache[name.copy()] = toks.copy()
+        return toks
+
+    def _apply_var(self, ctx: DOM, expr: str) -> str:
+        parts = expr.split("|")
+        val_obj = _resolve_path(ctx, parts[0])
+        is_safe = False
+        has_str = False
+        s = ""
+
+        fi = 1
+        while fi < len(parts):
+            fname = parts[fi].strip()
+            if fname == "safe":
+                is_safe = True
+            elif fname == "length":
+                if val_obj.kind == DOM_ARRAY:
+                    s = str(len(val_obj.arr))
+                elif val_obj.kind == DOM_OBJECT:
+                    s = str(len(val_obj.keys))
+                elif val_obj.kind == DOM_STR:
+                    s = str(len(val_obj.as_str()))
+                else:
+                    s = "0"
+                has_str = True
+            elif fname.startswith("default(") and fname.endswith(")"):
+                if not _val_truthy(val_obj):
+                    arg = fname[8:len(fname) - 1].strip()
+                    if (arg.startswith('"') and arg.endswith('"')) or (arg.startswith("'") and arg.endswith("'")):
+                        s = arg[1:len(arg) - 1]
+                    else:
+                        s = arg
+                    has_str = True
+            else:
+                if not has_str:
+                    s = _val_to_str(val_obj)
+                    has_str = True
+                if fname == "upper":
+                    s = s.upper()
+                elif fname == "capitalize":
+                    if len(s) > 0:
+                        s = s[0:1].upper() + s[1:len(s)].lower()
+                elif fname == "lower":
+                    s = s.lower()
+                elif fname == "trim" or fname == "strip":
+                    s = s.strip()
+                elif fname in self.filters:
+                    fn = self.filters[fname]
+                    s = fn(s)
+            fi += 1
+
+        if not has_str:
+            s = _val_to_str(val_obj)
+        if is_safe:
+            return s
+        return html_escape(s)
+
+    def _render_tokens(self, toks: list[_Tok], start: int, end: int, ctx: DOM, overrides: dict[str, str]) -> str:
+        out: list[str] = []
+        i = start
+        while i < end:
+            tk = toks[i].kind
+            tv = toks[i].val
+            if tk == TOK_TEXT:
+                out.append(tv.copy())
+                i += 1
+            elif tk == TOK_VAR:
+                out.append(self._apply_var(ctx, tv))
+                i += 1
+            elif tk == TOK_TAG:
+                if tv.startswith("if "):
+                    end_i = _find_matching_end(toks, i + 1, "if", "endif")
+                    branch_conds: list[str] = [tv[3:len(tv)].strip()]
+                    branch_starts: list[int] = [i + 1]
+                    branch_ends: list[int] = []
+                    depth = 0
+                    j = i + 1
+                    while j < end_i:
+                        if toks[j].kind == TOK_TAG:
+                            bt = toks[j].val
+                            if bt.startswith("if "):
+                                depth += 1
+                            elif bt == "endif":
+                                depth -= 1
+                            elif depth == 0 and bt.startswith("elif "):
+                                branch_ends.append(j)
+                                branch_conds.append(bt[5:len(bt)].strip())
+                                branch_starts.append(j + 1)
+                            elif depth == 0 and bt == "else":
+                                branch_ends.append(j)
+                                branch_conds.append("true")
+                                branch_starts.append(j + 1)
+                        j += 1
+                    branch_ends.append(end_i)
+                    bi = 0
+                    while bi < len(branch_conds):
+                        if _eval_cond(ctx, branch_conds[bi]):
+                            out.append(self._render_tokens(toks, branch_starts[bi], branch_ends[bi], ctx, overrides))
+                            break
+                        bi += 1
+                    i = end_i + 1
+                elif tv.startswith("set "):
+                    eq_pos = tv.find("=")
+                    if eq_pos > 4:
+                        sname = tv[4:eq_pos].strip()
+                        sexpr = tv[eq_pos + 1:len(tv)].strip()
+                        sval = _resolve_path(ctx, sexpr)
+                        ctx.set(sname, sval)
+                    i += 1
+                elif tv.startswith("for "):
+                    end_i = _find_matching_end(toks, i + 1, "for", "endfor")
+                    else_i = -1
+                    fdepth = 0
+                    fj = i + 1
+                    while fj < end_i:
+                        if toks[fj].kind == TOK_TAG:
+                            ft = toks[fj].val
+                            if ft.startswith("for ") or ft.startswith("if "):
+                                fdepth += 1
+                            elif ft == "endfor" or ft == "endif":
+                                fdepth -= 1
+                            elif fdepth == 0 and ft == "else":
+                                else_i = fj
+                                break
+                        fj += 1
+                    body_end = end_i if else_i < 0 else else_i
+                    in_pos = tv.find(" in ")
+                    if in_pos > 4:
+                        vname = tv[4:in_pos].strip()
+                        iter_expr = tv[in_pos + 4:len(tv)].strip()
+                        seq = _resolve_path(ctx, iter_expr)
+                        if seq.kind == DOM_ARRAY and len(seq.arr) > 0:
+                            slen = len(seq.arr)
+                            old_v = ctx.get(vname)
+                            has_old_v = old_v is not None
+                            saved_v = json.json_null()
+                            if old_v is not None:
+                                saved_v = old_v.copy()
+                            old_lp = ctx.get("loop")
+                            has_old_lp = old_lp is not None
+                            saved_lp = json.json_null()
+                            if old_lp is not None:
+                                saved_lp = old_lp.copy()
+                            si = 0
+                            while si < slen:
+                                ctx.set(vname.copy(), seq.arr[si].copy())
+                                lp = json.json_object()
+                                lp.set("index", json.json_int(si + 1))
+                                lp.set("index0", json.json_int(si))
+                                lp.set("first", json.json_bool(si == 0))
+                                lp.set("last", json.json_bool(si == slen - 1))
+                                lp.set("length", json.json_int(slen))
+                                ctx.set("loop", lp)
+                                out.append(self._render_tokens(toks, i + 1, body_end, ctx, overrides))
+                                si += 1
+                            if has_old_v:
+                                ctx.set(vname.copy(), saved_v)
+                            else:
+                                ctx.set(vname.copy(), json.json_null())
+                            if has_old_lp:
+                                ctx.set("loop", saved_lp)
+                            else:
+                                ctx.set("loop", json.json_null())
+                        elif else_i >= 0:
+                            out.append(self._render_tokens(toks, else_i + 1, end_i, ctx, overrides))
+                    i = end_i + 1
+                elif tv.startswith("block "):
+                    bname = tv[6:len(tv)].strip()
+                    end_i = _find_matching_end(toks, i + 1, "block", "endblock")
+                    if bname in overrides:
+                        btoks = _tokenize(overrides[bname])
+                        out.append(self._render_tokens(btoks, 0, len(btoks), ctx, overrides))
+                    else:
+                        out.append(self._render_tokens(toks, i + 1, end_i, ctx, overrides))
+                    i = end_i + 1
+                elif tv.startswith("include "):
+                    inc = tv[8:len(tv)].strip()
+                    if (inc.startswith('"') and inc.endswith('"')) or (inc.startswith("'") and inc.endswith("'")):
+                        inc = inc[1:len(inc) - 1]
+                    itoks = self.load_tokens(inc)
+                    out.append(self._render_tokens(itoks, 0, len(itoks), ctx, overrides))
+                    i += 1
+                else:
+                    i += 1
+            else:
+                i += 1
+        return "".join(out)
+
+    def render_string(self, src: str, ctx: DOM) -> str:
+        toks = _tokenize(src)
+        empty: dict[str, str] = {}
+        if len(toks) > 0 and toks[0].kind == TOK_TAG and toks[0].val.startswith("extends "):
+            parent = toks[0].val[8:len(toks[0].val)].strip()
+            if (parent.startswith('"') and parent.endswith('"')) or (parent.startswith("'") and parent.endswith("'")):
+                parent = parent[1:len(parent) - 1]
+            overrides = _extract_blocks(src)
+            ptoks = self.load_tokens(parent)
+            return self._render_tokens(ptoks, 0, len(ptoks), ctx, overrides)
+        return self._render_tokens(toks, 0, len(toks), ctx, empty)
+
+    def render(self, name: str, ctx: DOM) -> str:
+        toks = self.load_tokens(name)
+        empty: dict[str, str] = {}
+        if len(toks) > 0 and toks[0].kind == TOK_TAG and toks[0].val.startswith("extends "):
+            parent = toks[0].val[8:len(toks[0].val)].strip()
+            if (parent.startswith('"') and parent.endswith('"')) or (parent.startswith("'") and parent.endswith("'")):
+                parent = parent[1:len(parent) - 1]
+            overrides = _extract_blocks(self.load_source(name))
+            ptoks = self.load_tokens(parent)
+            return self._render_tokens(ptoks, 0, len(ptoks), ctx, overrides)
+        return self._render_tokens(toks, 0, len(toks), ctx, empty)

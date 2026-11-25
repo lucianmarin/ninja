@@ -1,0 +1,5 @@
+name: "ninja"
+version: "0.1.0"
+entry: "ninja.str"
+deps:
+    strlib: "lucianmarin/strlib"
