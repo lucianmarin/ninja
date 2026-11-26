@@ -3,7 +3,6 @@ import html
 import json
 import os
 from json import DOM, DOM_NULL, DOM_BOOL, DOM_INT, DOM_FLOAT, DOM_STR, DOM_ARRAY, DOM_OBJECT
-from typing import Callable
 
 def html_escape(s: str) -> str:
     return html.escape(s)
